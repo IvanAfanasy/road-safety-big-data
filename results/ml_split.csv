@@ -1,0 +1,4 @@
+group,rows,severe_share
+train,210261,0.23729555171905395
+test,100918,0.2483699637329317
+excluded,10,
