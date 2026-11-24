@@ -1,285 +1,213 @@
-# road-safety-big-data
-Групповой проект по дисциплине «Архитектура больших данных». Анализ ДТП в Великобритании.
-# Анализ ДТП в Великобритании
+# Анализ ДТП — как запустить
 
-Групповой проект по дисциплине «Архитектура больших данных».
+Проект загружает данные ДТП в PostgreSQL, выполняет анализ в Jupyter и показывает готовый дашборд в Superset.
 
-Цель проекта — исследовать связь условий движения с тяжестью зарегистрированных ДТП, проверить три гипотезы и представить результаты на интерактивном дашборде.
+Первый запуск выполняется по шагам ниже. Для последующих запусков используйте последний раздел.
 
+## 1. Установите программы и скачайте проект
 
+Нужны Docker Desktop, Python 3.12 или 3.13, Git и VS Code. В VS Code установите расширения Python и Jupyter.
 
-## Данные
+Откройте Docker Desktop и дождитесь его запуска.
 
-Используется открытый набор STATS19 Collisions.
-
-Страница источника:
-https://www.gov.uk/government/statistical-data-sets/road-safety-open-data
-
-Исходный файл:
-
-`dft-road-casualty-statistics-collision-1979-latest-published-year.csv`
-
-Объём — приблизительно 1,5 ГБ.
-
-Исходный CSV размещается локально:
-
-`data/raw/dft-road-casualty-statistics-collision-1979-latest-published-year.csv`
-
-CSV не включается в репозиторий. Для воспроизведения результатов используйте ту же версию набора. Точную ссылку скачивания и дату получения файла необходимо зафиксировать дополнительно.
-
-## Архитектура
-
-CSV → ETL на Python → PostgreSQL → анализ в Jupyter → визуализация в Superset.
-
-PostgreSQL запускается в Docker. Данные БД сохраняются в Docker volume.
-
-ETL обрабатывает полный CSV порциями по 100 000 строк и сохраняет восемь используемых столбцов за все годы.
-
-Годовая статистика рассчитывается по всей таблице. Проверка гипотез и моделирование выполняются за 2022–2024 годы.
-
-## Инструменты
-
-- Python и Jupyter.
-- Pandas, NumPy, SciPy и Scikit-learn.
-- SQLAlchemy и Psycopg.
-- PostgreSQL 17.
-- Docker Desktop и Docker Compose.
-- Apache Superset 6.0.0-dev.
-- Matplotlib и Plotly.
-
-## Гипотезы
-
-1. Доля тяжёлых и смертельных ДТП на дорогах с ограничением 50–70 mph выше, чем на дорогах с ограничением 20–30 mph.
-2. Доля тяжёлых и смертельных ДТП в темноте без освещения выше, чем при дневном свете.
-3. В часы пик 07:00–09:59 и 16:00–18:59 регистрируется больше ДТП в расчёте на час, чем в остальные часы.
-
-Дополнительно выполняются корреляционный анализ, описательная логистическая регрессия и классификация тяжести ДТП.
-
-Модель классификации обучается на 2022–2023 годах и проверяется на 2024 году.
-
-## 1. Подготовка Python
-
-Установите Python, VS Code и Docker Desktop.
-
-Откройте терминал в корне проекта и создайте окружение:
+В терминале выполните команды по очереди:
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
-python -m pip install --upgrade pip
-python -m pip install pandas numpy scipy matplotlib scikit-learn sqlalchemy "psycopg[binary]" python-dotenv jupyterlab ipykernel plotly nbformat
+git clone https://github.com/IvanAfanasy/road-safety-big-data.git
+cd road-safety-big-data
 ```
 
-Если окружение уже создано, активируйте его вместо повторного создания.
+Если проект уже скачан, откройте его папку в VS Code и создайте терминал в этой папке.
 
-## 2. Настройка PostgreSQL
+## 2. Добавьте датасет и настройки
 
-Создайте в корне проекта локальный файл `.env`:
+Возьмите у команды исходный файл `dft-road-casualty-statistics-collision-1979-latest-published-year.csv` объёмом около 1,5 ГБ. Положите его в папку проекта:
+
+```text
+data/raw/dft-road-casualty-statistics-collision-1979-latest-published-year.csv
+```
+
+Создайте рядом с `compose.yaml` файл `.env`:
 
 ```dotenv
 POSTGRES_DB=road_safety
 POSTGRES_USER=road_user
-POSTGRES_PASSWORD=CHANGE_ME
+POSTGRES_PASSWORD=MyLocalPassword_2026
 POSTGRES_PORT=5432
 ```
 
-Замените `CHANGE_ME` своим паролем до первого запуска БД.
+Пароль можно выбрать свой до первого запуска базы. Сохраните его для подключения Superset. Если база уже настроена, используйте существующий `.env`.
 
-Файл `.env` не добавляется в GitHub.
+## 3. Подготовьте Python
 
-Запустите Docker Desktop, затем выполните:
+На Mac:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+```
+
+На Windows в PowerShell:
+
+```powershell
+py -m venv .venv
+.\.venv\Scripts\Activate.ps1
+```
+
+Если PowerShell запрещает активацию, разрешите её для текущего окна и повторите:
+
+```powershell
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+.\.venv\Scripts\Activate.ps1
+```
+
+Затем установите библиотеки:
+
+```bash
+python -m pip install pandas numpy scipy matplotlib scikit-learn sqlalchemy "psycopg[binary]" python-dotenv jupyterlab ipykernel plotly nbformat
+```
+
+## 4. Запустите базу и загрузите данные
+
+В терминале папки `road-safety-big-data`:
 
 ```bash
 docker compose up -d postgres
 docker compose ps
 ```
 
-Дождитесь статуса `healthy`.
+Дождитесь статуса `healthy` у PostgreSQL.
 
-Создайте таблицу:
-
-```bash
-docker compose exec -T postgres psql -U road_user -d road_safety -v ON_ERROR_STOP=1 < sql/schema.sql
-```
-
-Проверьте соединение:
+Создайте таблицу. Эти команды подходят для Mac и Windows:
 
 ```bash
-docker compose exec postgres psql -U road_user -d road_safety -c "SELECT current_database(), current_user;"
+docker compose cp sql/schema.sql postgres:/tmp/road_safety_schema.sql
+docker compose exec postgres psql -U road_user -d road_safety -v ON_ERROR_STOP=1 -f /tmp/road_safety_schema.sql
 ```
 
-## 3. Загрузка данных
-
-Поместите исходный CSV в `data/raw/`.
-
-Запустите:
+Загрузите полный датасет:
 
 ```bash
 python etl.py
 ```
 
-Дождитесь сообщения «Загрузка завершена».
+Дождитесь сообщения **«Загрузка завершена»**. Не закрывайте Docker и терминал во время загрузки.
 
-ETL проверяет идентификаторы, преобразует числовые поля, даты и время, затем загружает данные в PostgreSQL.
+## 5. Выполните ноутбук
 
-Совпадающие повторные записи пропускаются. Разные записи с одинаковым идентификатором останавливают загрузку и требуют разбора.
+В VS Code откройте `analysis-2.ipynb`.
 
-Отчёты сохраняются в `results/etl_report_*.json`. При наличии отклонённых записей создаются файлы `results/etl_rejects_*.csv`.
+1. Справа сверху выберите ядро Python из созданной папки `.venv`.
+2. Нажмите «Перезапустить», затем «Выполнить все».
+3. Дождитесь завершения без ошибок и сохраните файл.
 
-Проверка количества строк:
+Результаты появятся в `results`. Ноутбук также создаст представление `collisions_dashboard`, которое нужно для дашборда.
 
-```bash
-docker compose exec postgres psql -U road_user -d road_safety -c "SELECT COUNT(*) FROM public.collisions;"
-```
+## 6. Запустите Superset
 
-## 4. Выполнение анализа
-
-Откройте `analysis-2.ipynb` в VS Code.
-
-1. Выберите ядро своего Python-окружения.
-2. Убедитесь, что ETL завершён.
-3. Перезапустите ядро.
-4. Нажмите «Выполнить все».
-5. Дождитесь завершения всех ячеек и сохраните ноутбук.
-
-Ноутбук получает данные из PostgreSQL, проверяет гипотезы, обучает модель и создаёт представление `public.collisions_dashboard`.
-
-Результаты сохраняются в `results/`:
-
-- `quality.csv` — качество выборки.
-- `hypotheses.csv` — результаты проверки гипотез.
-- `regression.csv` — коэффициенты описательной регрессии.
-- `correlations.csv` — корреляционные показатели.
-- `ml_metrics.csv` — метрики классификации.
-- `confusion_matrix.csv` — матрица ошибок.
-- `conclusions.md` — выводы по выполненному анализу.
-- `*_interactive.html` — интерактивные графики.
-- `analysis_environment.json` — версии Python и библиотек.
-
-## 5. Запуск Superset на Mac
-
-Официальная конфигурация Superset скачивается в отдельную папку рядом с проектом.
+Откройте второй терминал в папке проекта. Скачайте Superset в соседнюю папку:
 
 ```bash
-cd ~/Projects
+cd ..
 git clone --depth 1 --branch 6.0.0 https://github.com/apache/superset.git superset-tools
 cd superset-tools
 ```
 
-Если папка уже существует, перейдите в неё.
+Если `superset-tools` уже существует, просто откройте терминал в ней.
 
-Сгенерируйте секретный ключ:
+Сгенерируйте ключ:
 
 ```bash
-openssl rand -hex 42
+python -c "import secrets; print(secrets.token_hex(42))"
 ```
 
-Создайте файл `docker/.env-local` в папке Superset:
+В папке `superset-tools/docker` создайте файл `.env-local`:
 
 ```dotenv
-SUPERSET_SECRET_KEY=PASTE_GENERATED_KEY
+TAG=6.0.0-dev
+SUPERSET_SECRET_KEY=ВСТАВЬТЕ_СГЕНЕРИРОВАННЫЙ_КЛЮЧ
 SUPERSET_LOAD_EXAMPLES=no
 ```
 
-Вместо `PASTE_GENERATED_KEY` вставьте сгенерированный ключ.
+Сохраните файл. Для существующей установки сохраняйте прежний секретный ключ.
 
-Запустите:
-
-```bash
-TAG=6.0.0-dev docker compose -f docker-compose-image-tag.yml up -d
-```
-
-Проверьте состояние:
+Запустите Superset из папки `superset-tools`:
 
 ```bash
-TAG=6.0.0-dev docker compose -f docker-compose-image-tag.yml ps -a
+docker compose --env-file docker/.env-local -f docker-compose-image-tag.yml up -d
 ```
 
-Инициализация `superset-init` должна завершиться с кодом 0.
+Проверьте:
 
-Откройте:
+```bash
+docker compose --env-file docker/.env-local -f docker-compose-image-tag.yml ps -a
+```
 
-http://localhost:8088
+Дождитесь запуска основного сервиса `superset`. Статус `Exited (0)` у `superset-init` означает успешную инициализацию.
 
-Начальные данные входа стандартной локальной конфигурации:
+Откройте в браузере http://localhost:8088 и войдите с логином `admin` и паролем `admin`.
 
-- Логин — `admin`.
-- Пароль — `admin`.
+## 7. Импортируйте готовый дашборд
 
-## 6. Подключение Superset к данным
+В Superset откройте **Dashboards** и нажмите **Import dashboard** — кнопку импорта со значком стрелки.
 
-В Superset откройте Settings → Database Connections → + Database → PostgreSQL.
+Выберите ZIP из корня скачанного проекта:
 
-Укажите:
+```text
+dashboard_export_20261124T212929.zip
+```
 
-| Параметр | Значение |
+Если запрашивается пароль базы, введите `POSTGRES_PASSWORD` из вашего `.env` проекта. Завершите импорт.
+
+Проверьте подключение через **Settings → Database Connections**. Для Docker Desktop на Mac и Windows используются:
+
+| Поле | Значение |
 |---|---|
-| Host | host.docker.internal |
-| Port | 5432 или порт из `.env` проекта |
-| Database | road_safety |
-| Username | road_user |
-| Password | Фактический пароль из `.env` проекта |
+| Host | `host.docker.internal` |
+| Port | `5432` |
+| Database | `road_safety` |
+| Username | `road_user` |
+| Password | Ваш пароль из `.env` проекта |
 
-Эти параметры предназначены для Superset в отдельном Docker Compose на Mac.
+При другом порте укажите значение `POSTGRES_PORT`.
 
-Проверьте подключение и сохраните его под названием `Road Safety`.
+Откройте **Dashboards → Анализ ДТП**. Графики, расположение и фильтры восстанавливаются из ZIP. Выберите год и нажмите **Apply filters**, чтобы проверить работу.
 
-Через Datasets добавьте представление:
+Если импорт сообщает об ошибке структуры ZIP, используйте оригинальный архив экспорта Superset. Safari может автоматически распаковать его при скачивании.
 
-`public.collisions_dashboard`
+## Как включать проект в следующий раз
 
-## 7. Дашборд
-
-Дашборд «Анализ ДТП» включает:
-
-- Количество ДТП по годам.
-- Распределение ДТП по часам.
-- Долю тяжёлых ДТП по ограничению скорости.
-- Долю тяжёлых ДТП по освещению.
-- Тепловую карту по дням недели и часам.
-
-Для доли тяжёлых ДТП используется выражение:
-
-```sql
-100.0 * SUM(severe) / NULLIF(COUNT(severe), 0)
-```
-
-Фильтр года применяется к исследовательским графикам. Годовая динамика показывает весь исторический период.
-
-После сборки дашборд экспортируется через меню Superset в ZIP.
-
-Экспорт размещается в:
-
-`superset/dashboard_export.zip`
-
-На другом компьютере сначала настройте БД и загрузите данные. Затем импортируйте ZIP через раздел Dashboards и укажите пароль подключения, если Superset его запросит.
-
-## 8. Повторный запуск
-
-Запустите Docker Desktop.
-
-В папке проекта:
+1. Откройте Docker Desktop.
+2. В терминале папки `road-safety-big-data` выполните:
 
 ```bash
 docker compose up -d postgres
 ```
 
-В папке Superset:
+3. В терминале папки `superset-tools` выполните:
 
 ```bash
-TAG=6.0.0-dev docker compose -f docker-compose-image-tag.yml up -d
+docker compose --env-file docker/.env-local -f docker-compose-image-tag.yml up -d
 ```
 
-Повторная загрузка CSV при сохранённой БД не требуется.
+4. Откройте http://localhost:8088 → **Dashboards → Анализ ДТП**.
 
-## Ограничения исследования
+Данные, графики и настройки сохраняются между обычными перезапусками. Повторная загрузка CSV и импорт дашборда нужны при первоначальной настройке или обновлении. Ноутбук запускайте, когда нужны новые расчёты.
 
-Набор содержит зарегистрированные полицией ДТП с пострадавшими.
+## Как выключать
 
-Ограничение скорости отличается от фактической скорости автомобиля.
+Сохраните ноутбук и дашборд.
 
-Без данных об интенсивности движения нельзя рассчитать риск ДТП на одну поездку.
+В папке `superset-tools`:
 
-Наблюдаемые зависимости не устанавливают причинность. Изменения методики регистрации ограничивают сравнение исторических периодов.
+```bash
+docker compose --env-file docker/.env-local -f docker-compose-image-tag.yml stop
+```
 
-Метрики классификации относятся к тестовому периоду 2024 года.
+В папке `road-safety-big-data`:
+
+```bash
+docker compose stop postgres
+```
+
+После этого можно закрыть Docker Desktop.
