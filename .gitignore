@@ -225,3 +225,6 @@ __marimo__/
 data/raw/
 .env
 .venv/
+
+# Results produced by the current DAG.
+results/latest/

@@ -1,244 +1,165 @@
+import csv
 import json
 import os
-from datetime import datetime, timezone
-from io import StringIO
+import sys
+from datetime import date
+from gzip import open as open_gzip
 from pathlib import Path
-
-import pandas as pd
-import psycopg
-from dotenv import load_dotenv
+from tempfile import TemporaryDirectory
 
 
 ROOT = Path(__file__).resolve().parent
-SOURCE = (
-    ROOT / "data" / "raw"
-    / "dft-road-casualty-statistics-collision-1979-latest-published-year.csv"
+SOURCE = ROOT / "data/raw" / os.getenv(
+    "SOURCE_CSV", "dft-road-casualty-statistics-collision-1979-latest-published-year.csv"
 )
-RESULTS = ROOT / "results"
-CHUNK_SIZE = 100_000
-
-COLUMNS = [
-    "collision_index",
-    "collision_year",
-    "collision_severity",
-    "speed_limit",
-    "light_conditions",
-    "date",
-    "time",
-    "police_force",
-]
-
-NUMERIC_COLUMNS = [
-    "collision_year",
-    "collision_severity",
-    "speed_limit",
-    "light_conditions",
-    "police_force",
-]
+RESULTS = Path(os.getenv("RESULTS_DIR", ROOT / "results/latest"))
+COLUMNS = (
+    "collision_index", "collision_year", "collision_severity", "speed_limit",
+    "light_conditions", "date", "time", "police_force",
+)
+NUMBER_COLUMNS = (
+    "collision_year", "collision_severity", "speed_limit", "light_conditions", "police_force",
+)
 
 
-def prepare(raw):
-    """Преобразовать блок и выделить записи с неверным ключом или годом."""
-    data = raw[COLUMNS].copy()
+def check_source():
+    if not SOURCE.is_file():
+        raise FileNotFoundError(f"Положите исходный CSV в {SOURCE}")
+    size = SOURCE.stat().st_size
+    minimum = int(os.getenv("MIN_SOURCE_BYTES", "500000000"))
+    if size <= minimum:
+        raise ValueError(f"Размер CSV {size:,} байт. Требуется больше {minimum:,} байт.")
+    open_csv = open_gzip if SOURCE.suffix == ".gz" else open
+    with open_csv(SOURCE, "rt", encoding="utf-8-sig", newline="") as file:
+        header = next(csv.reader(file), [])
+    missing = set(COLUMNS) - set(header)
+    if missing:
+        raise ValueError(f"В CSV нет столбцов: {', '.join(sorted(missing))}")
+    print(f"CSV: {SOURCE.name}, {size:,} байт")
+    return size
 
-    for column in COLUMNS:
-        data[column] = data[column].str.strip()
 
-    for column in NUMERIC_COLUMNS:
-        numbers = pd.to_numeric(data[column], errors="coerce")
-        valid = (
-            numbers.between(-32768, 32767)
-            & numbers.mod(1).eq(0)
-        )
-        data[column] = numbers.where(valid).astype("Int64")
+def postgres_connection():
+    import psycopg
 
-    valid_id = (
-        data["collision_index"].ne("")
-        & ~data["collision_index"].str.contains("\x00", regex=False)
+    return psycopg.connect(
+        host=os.getenv("POSTGRES_HOST", "127.0.0.1"),
+        port=os.getenv("POSTGRES_PORT", "5432"),
+        dbname=os.environ["POSTGRES_DB"],
+        user=os.environ["POSTGRES_USER"],
+        password=os.environ["POSTGRES_PASSWORD"],
+        connect_timeout=10,
     )
-    current_year = datetime.now(timezone.utc).year
-    valid_year = data["collision_year"].between(1979, current_year).fillna(False)
-    accepted = valid_id & valid_year
 
-    rejected = raw.loc[~accepted, COLUMNS].copy()
-    rejected["reason"] = "Пустой/некорректный идентификатор или год"
 
-    dates = pd.to_datetime(
-        data["date"], format="%d/%m/%Y", errors="coerce"
-    )
-    dates = dates.where(
-        dates.dt.year.eq(data["collision_year"]).fillna(False)
-    )
-    data["date"] = dates.dt.strftime("%Y-%m-%d")
+def clean_csv(spark):
+    from pyspark.sql import functions as F
 
-    valid_time = data["time"].str.fullmatch(
-        r"(?:[01]\d|2[0-3]):[0-5]\d"
-    )
-    data["time"] = data["time"].where(valid_time, pd.NA)
+    raw = spark.read.csv(str(SOURCE), header=True, mode="FAILFAST")
+    clean = raw.select(*(F.trim(column).alias(column) for column in COLUMNS))
+    for column in NUMBER_COLUMNS:
+        clean = clean.withColumn(column, F.expr(f"try_cast({column} AS SMALLINT)"))
 
-    return data.loc[accepted, COLUMNS], rejected
+    parsed_date = F.try_to_timestamp("date", F.lit("dd/MM/yyyy")).cast("date")
+    clean = clean.withColumn("date", F.when(F.year(parsed_date) == F.col("collision_year"), parsed_date))
+    clean = clean.withColumn("time", F.when(F.col("time").rlike(r"^([01][0-9]|2[0-3]):[0-5][0-9]$"), F.col("time")))
+
+    collision_id = F.col("collision_index")
+    valid_id = (F.length(collision_id) > 0) & ~collision_id.contains(chr(0))
+    valid_year = F.col("collision_year").between(1979, date.today().year)
+    return clean.withColumn("valid", F.coalesce(valid_id & valid_year, F.lit(False)))
+
+
+def load_postgres(csv_dir):
+    columns = ", ".join(COLUMNS)
+    updated = ", ".join(f"{column} = EXCLUDED.{column}" for column in COLUMNS[1:])
+    current = ", ".join(f"c.{column}" for column in COLUMNS[1:])
+    incoming = ", ".join(f"EXCLUDED.{column}" for column in COLUMNS[1:])
+
+    with postgres_connection() as conn, conn.cursor() as cursor:
+        cursor.execute("SELECT pg_advisory_xact_lock(240117)")
+        cursor.execute((ROOT / "sql/schema.sql").read_text(encoding="utf-8"))
+        cursor.execute(f"""
+            CREATE TEMP TABLE staging_collisions ON COMMIT DROP AS
+            SELECT {columns} FROM public.collisions WITH NO DATA
+        """)
+        for path in sorted(csv_dir.glob("part-*.csv.gz")):
+            with open_gzip(path, "rb") as file, cursor.copy(
+                f"COPY staging_collisions ({columns}) FROM STDIN WITH (FORMAT CSV)"
+            ) as copy:
+                while block := file.read(1024 * 1024):
+                    copy.write(block)
+
+        # Spark removes identical rows. A repeated key here means conflicting values.
+        cursor.execute("CREATE UNIQUE INDEX ON staging_collisions (collision_index)")
+        cursor.execute("SELECT COUNT(*) FROM staging_collisions")
+        staged = cursor.fetchone()[0]
+        if staged == 0:
+            raise ValueError("После очистки не осталось строк для загрузки.")
+
+        cursor.execute(f"""
+            INSERT INTO public.collisions AS c ({columns})
+            SELECT {columns} FROM staging_collisions
+            ON CONFLICT (collision_index) DO UPDATE SET {updated}
+            WHERE ROW({current}) IS DISTINCT FROM ROW({incoming})
+        """)
+        changed = cursor.rowcount
+        cursor.execute((ROOT / "sql/dashboard.sql").read_text(encoding="utf-8"))
+        cursor.execute("ANALYZE public.collisions")
+        cursor.execute("SELECT COUNT(*) FROM public.collisions")
+        return staged, changed, cursor.fetchone()[0]
 
 
 def main():
-    load_dotenv(ROOT / ".env")
+    from pyspark.sql import SparkSession
+    from pyspark.sql import functions as F
 
-    if not SOURCE.is_file():
-        raise FileNotFoundError(f"Не найден датасет: {SOURCE}")
+    source_bytes = check_source()
+    spark = (
+        SparkSession.builder.appName("STATS19")
+        .config("spark.sql.shuffle.partitions", "8")
+        .config("spark.sql.legacy.timeParserPolicy", "CORRECTED")
+        .getOrCreate()
+    )
+    spark.sparkContext.setLogLevel("WARN")
+    try:
+        with TemporaryDirectory(prefix="stats19-") as folder:
+            csv_dir = Path(folder) / "clean"
+            data = clean_csv(spark).cache()
+            counts = data.agg(
+                F.count("*").alias("read"),
+                F.count(F.when(~F.col("valid"), 1)).alias("rejected"),
+                F.count(F.when(F.col("valid") & F.col("date").isNull(), 1)).alias("missing_date"),
+                F.count(F.when(F.col("valid") & F.col("time").isNull(), 1)).alias("missing_time"),
+            ).first()
+            clean = data.filter("valid").select(*COLUMNS).dropDuplicates()
+            clean.write.option("escape", '"').csv(str(csv_dir), compression="gzip")
+            data.unpersist()
 
-    RESULTS.mkdir(exist_ok=True)
-    run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
-    reject_path = RESULTS / f"etl_rejects_{run_id}.csv"
-    report_path = RESULTS / f"etl_report_{run_id}.json"
+            staged, changed, total = load_postgres(csv_dir)
+    finally:
+        spark.stop()
 
     report = {
         "source": SOURCE.name,
-        "source_bytes": SOURCE.stat().st_size,
-        "status": "running",
-        "rows_read": 0,
-        "rows_rejected": 0,
-        "rows_inserted": 0,
-        "rows_duplicate": 0,
-        "missing_values": {column: 0 for column in COLUMNS},
+        "source_bytes": source_bytes,
+        "rows_read": counts["read"],
+        "rows_rejected": counts["rejected"],
+        "rows_duplicate": counts["read"] - counts["rejected"] - staged,
+        "rows_staged": staged,
+        "rows_changed": changed,
+        "rows_in_database": total,
+        "accepted_missing_date": counts["missing_date"],
+        "accepted_missing_time": counts["missing_time"],
     }
-
-    try:
-        with psycopg.connect(
-            host="127.0.0.1",
-            port=os.getenv("POSTGRES_PORT", "5432"),
-            dbname=os.environ["POSTGRES_DB"],
-            user=os.environ["POSTGRES_USER"],
-            password=os.environ["POSTGRES_PASSWORD"],
-            autocommit=True,
-        ) as conn:
-            with conn.cursor() as cur:
-                # Запрет одновременного запуска двух копий этого ETL.
-                cur.execute("SELECT pg_try_advisory_lock(240117)")
-                if not cur.fetchone()[0]:
-                    raise RuntimeError("Другой процесс ETL уже работает.")
-
-                cur.execute("""
-                    CREATE TEMP TABLE staging_collisions
-                    (LIKE public.collisions)
-                    ON COMMIT DELETE ROWS
-                """)
-
-                reader = pd.read_csv(
-                    SOURCE,
-                    usecols=COLUMNS,
-                    dtype="string",
-                    keep_default_na=False,
-                    chunksize=CHUNK_SIZE,
-                    encoding="utf-8-sig",
-                )
-
-                for number, raw in enumerate(reader, start=1):
-                    report["rows_read"] += len(raw)
-                    clean, rejected = prepare(raw)
-
-                    if not rejected.empty:
-                        rejected.to_csv(
-                            reject_path,
-                            mode="a",
-                            header=not reject_path.exists(),
-                            index=False,
-                            encoding="utf-8",
-                        )
-                    report["rows_rejected"] += len(rejected)
-
-                    missing = clean.isna().sum()
-                    for column in COLUMNS:
-                        report["missing_values"][column] += int(missing[column])
-
-                    if not clean.empty:
-                        with conn.transaction():
-                            # CSV-буфер содержит только один обработанный блок.
-                            buffer = StringIO()
-                            clean.to_csv(
-                                buffer,
-                                index=False,
-                                header=False,
-                                na_rep="",
-                                lineterminator="\n",
-                            )
-
-                            with cur.copy("""
-                                COPY staging_collisions
-                                FROM STDIN WITH (FORMAT CSV)
-                            """) as copy:
-                                copy.write(buffer.getvalue())
-
-                            # Одинаковый ID с разными данными требует разбора.
-                            cur.execute("""
-                                SELECT collision_index
-                                FROM staging_collisions AS s
-                                GROUP BY collision_index
-                                HAVING COUNT(DISTINCT ROW(s.*)) > 1
-                                LIMIT 1
-                            """)
-                            conflict = cur.fetchone()
-
-                            if conflict:
-                                raise ValueError(
-                                    f"Разные записи с одним ID: {conflict[0]}"
-                                )
-
-                            cur.execute("""
-                                SELECT s.collision_index
-                                FROM staging_collisions AS s
-                                JOIN public.collisions AS c
-                                  USING (collision_index)
-                                WHERE ROW(c.*) IS DISTINCT FROM ROW(s.*)
-                                LIMIT 1
-                            """)
-                            conflict = cur.fetchone()
-
-                            if conflict:
-                                raise ValueError(
-                                    "Запись отличается от уже загруженной: "
-                                    f"{conflict[0]}"
-                                )
-
-                            cur.execute("""
-                                INSERT INTO public.collisions
-                                SELECT DISTINCT *
-                                FROM staging_collisions
-                                ON CONFLICT (collision_index) DO NOTHING
-                            """)
-                            inserted = cur.rowcount
-
-                        report["rows_inserted"] += inserted
-                        report["rows_duplicate"] += len(clean) - inserted
-
-                    print(
-                        f"Блок {number}: "
-                        f"прочитано {report['rows_read']:,}; "
-                        f"добавлено {report['rows_inserted']:,}; "
-                        f"повторов {report['rows_duplicate']:,}; "
-                        f"отклонено {report['rows_rejected']:,}",
-                        flush=True,
-                    )
-
-                cur.execute("ANALYZE public.collisions")
-                cur.execute("SELECT COUNT(*) FROM public.collisions")
-                report["rows_in_database"] = cur.fetchone()[0]
-
-        report["status"] = "completed"
-
-    except Exception as exc:
-        report["status"] = "failed"
-        report["error"] = str(exc)
-        raise
-
-    finally:
-        report_path.write_text(
-            json.dumps(report, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-        print(f"Отчёт: {report_path}", flush=True)
-
-    print("Загрузка завершена.")
-    print(f"Строк в БД: {report['rows_in_database']:,}")
+    RESULTS.mkdir(parents=True, exist_ok=True)
+    output = RESULTS / "load_report.json"
+    output.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    print(output.read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__":
-    main()
+    if sys.argv[1:] == ["check"]:
+        check_source()
+    else:
+        main()

@@ -1,0 +1,13 @@
+*
+!requirements.txt
+!etl.py
+!analysis.py
+!dags/
+!dags/*.py
+!sql/
+!sql/*.sql
+!data/
+!data/reference/
+!data/reference/*.csv
+data/raw
+data/raw/**
