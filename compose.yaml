@@ -2,18 +2,14 @@ services:
   postgres:
     image: postgres:17
     restart: unless-stopped
-
     environment:
-      POSTGRES_DB: ${POSTGRES_DB}
-      POSTGRES_USER: ${POSTGRES_USER}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
-
+      POSTGRES_DB: ${POSTGRES_DB:?Set POSTGRES_DB in .env}
+      POSTGRES_USER: ${POSTGRES_USER:?Set POSTGRES_USER in .env}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
     ports:
-      - "127.0.0.1:${POSTGRES_PORT}:5432"
-
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
-
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
       interval: 5s
@@ -21,5 +17,33 @@ services:
       retries: 12
       start_period: 10s
 
+  airflow:
+    build: .
+    init: true
+    command: ["airflow", "standalone"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      AIRFLOW__CORE__DAGS_FOLDER: /opt/road-safety/dags
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      AIRFLOW__CORE__EXECUTOR: SequentialExecutor
+      AIRFLOW__WEBSERVER__EXPOSE_CONFIG: "false"
+      POSTGRES_HOST: postgres
+      POSTGRES_DB: ${POSTGRES_DB:?Set POSTGRES_DB in .env}
+      POSTGRES_USER: ${POSTGRES_USER:?Set POSTGRES_USER in .env}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+      SOURCE_CSV: ${SOURCE_CSV:-dft-road-casualty-statistics-collision-1979-latest-published-year.csv}
+      MIN_SOURCE_BYTES: ${MIN_SOURCE_BYTES:-500000000}
+      RESULTS_DIR: /opt/airflow/results
+      SPARK_LOCAL_IP: 127.0.0.1
+      OPENBLAS_NUM_THREADS: "1"
+    ports:
+      - "127.0.0.1:${AIRFLOW_PORT:-8080}:8080"
+    volumes:
+      - airflow_data:/opt/airflow
+      - ./data/raw:/opt/road-safety/data/raw:ro
+
 volumes:
   postgres_data:
+  airflow_data:
